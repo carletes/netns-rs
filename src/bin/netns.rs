@@ -1,36 +1,99 @@
 use clap::{crate_version, App, AppSettings, Arg, SubCommand};
 use netlink_packet_route::{
-    NetlinkHeader, NetlinkMessage, NetlinkPayload, NsidMessage, RtnlMessage,
+    nsid, traits::ParseableParametrized, NetlinkBuffer, NetlinkHeader, NetlinkMessage,
+    NetlinkPayload, NsidHeader, NsidMessage, RtnlMessage, RtnlMessageBuffer, AF_UNSPEC,
+    NLM_F_REQUEST, RTM_NEWNSID,
 };
-use netlink_sys::{Protocol, Socket, SocketAddr};
+use netlink_sys::{Protocol, Socket};
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{read_dir, OpenOptions};
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process;
 
 struct NamedNetns {
     name: OsString,
-    nsid: i32,
+    nsid: Option<i32>,
+}
+
+impl fmt::Display for NamedNetns {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let nsid = match self.nsid {
+            Some(nsid) => format!("{}", nsid),
+            None => "undefined".to_string(),
+        };
+
+        write!(f, "{} (nsid: {})", self.name.to_string_lossy(), nsid)
+    }
 }
 
 static NETNS_REF_DIR: &str = "/var/run/netns";
 
 impl NamedNetns {
     fn new(name: OsString) -> io::Result<Self> {
-        // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 3
+        let mut ref_path = PathBuf::from(NETNS_REF_DIR);
+        ref_path.push(&name);
+        let ref_file = OpenOptions::new().read(true).open(ref_path)?;
+
+        // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 4
         let mut sock = Socket::new(Protocol::Route)?;
-        sock.connect(&SocketAddr::new(0, 0))?;
+
+        // bind(4, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
+        let _port_number = sock.bind_auto()?.port_number();
 
         let mut packet = NetlinkMessage {
-            header: NetlinkHeader::default(),
-            payload: NetlinkPayload::from(RtnlMessage::GetNsId(NsidMessage::default())),
+            header: NetlinkHeader {
+                flags: NLM_F_REQUEST,
+                sequence_number: 0,
+                ..Default::default()
+            },
+            payload: NetlinkPayload::from(RtnlMessage::GetNsId(NsidMessage {
+                header: NsidHeader {
+                    rtgen_family: AF_UNSPEC as u8,
+                },
+                nlas: vec![nsid::Nla::Fd(ref_file.as_raw_fd() as u32)],
+            })),
         };
 
-        Ok(NamedNetns {
-            name: name,
-            nsid: 0,
-        })
+        packet.finalize();
+
+        let mut buf = vec![0; 1024 * 8];
+        packet.serialize(&mut buf[..packet.buffer_len()]);
+        sock.send(&buf, 0)?;
+
+        let mut recv_buf = vec![0; 1024 * 8];
+        sock.recv(&mut recv_buf[..], 0)?;
+
+        let recv_packet = NetlinkBuffer::new_checked(&recv_buf[..])
+            .or_else(|err| Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err))))?;
+        let recv_payload = recv_packet.payload();
+        let recv_msgbuf = RtnlMessageBuffer::new(&recv_payload);
+        match RtnlMessage::parse_with_param(&recv_msgbuf, RTM_NEWNSID) {
+            Ok(RtnlMessage::NewNsId(NsidMessage { nlas, .. })) => match nlas.get(0) {
+                Some(nsid::Nla::Id(id)) => Ok(NamedNetns {
+                    name: name,
+                    nsid: match id {
+                        -1 => None,
+                        _ => Some(*id),
+                    },
+                }),
+                Some(unexpected) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Unexpected netlink attribute: {:?}", unexpected),
+                )),
+                None => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "No nsid attribute returned",
+                )),
+            },
+            Ok(unexpected) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Unexpected netlink response: {:?}", unexpected),
+            )),
+            Err(err) => Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err))),
+        }
     }
 }
 
@@ -64,8 +127,11 @@ fn list_netns() -> io::Result<()> {
         Ok(rd) => {
             for entry in rd {
                 let entry = entry?;
-                let ns = NamedNetns::new(entry.file_name())?;
-                println!("{} (id: {})", ns.name.to_string_lossy(), ns.nsid)
+
+                match NamedNetns::new(entry.file_name()) {
+                    Ok(ns) => println!("{}", ns),
+                    Err(err) => eprintln!("{}", err),
+                }
             }
             Ok(())
         }
