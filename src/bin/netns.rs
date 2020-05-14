@@ -1,8 +1,9 @@
 use clap::{crate_version, App, AppSettings, Arg, SubCommand};
 use netlink_packet_route::{
-    nsid, traits::ParseableParametrized, NetlinkBuffer, NetlinkHeader, NetlinkMessage,
-    NetlinkPayload, NsidHeader, NsidMessage, RtnlMessage, RtnlMessageBuffer, AF_UNSPEC,
-    NLM_F_REQUEST, RTM_NEWNSID,
+    nsid::Nla::{Fd, Id},
+    traits::ParseableParametrized,
+    NetlinkBuffer, NetlinkHeader, NetlinkMessage, NetlinkPayload, NsidHeader, NsidMessage,
+    RtnlMessage, RtnlMessageBuffer, AF_UNSPEC, NLM_F_REQUEST, RTM_NEWNSID,
 };
 use netlink_sys::{Protocol, Socket};
 use std::ffi::{OsStr, OsString};
@@ -31,19 +32,38 @@ impl fmt::Display for NamedNetns {
 
 static NETNS_REF_DIR: &str = "/var/run/netns";
 
+fn ref_path(name: &OsString) -> io::Result<PathBuf> {
+    let mut path = PathBuf::from(NETNS_REF_DIR);
+    path.push(name);
+    match path.parent() {
+        Some(p) => {
+            if p.as_os_str() == NETNS_REF_DIR {
+                Ok(path)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Invalid namespace name {}", name.to_string_lossy()),
+                ))
+            }
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Invalid namespace name {}", name.to_string_lossy()),
+        )),
+    }
+}
+
 impl NamedNetns {
     fn new(name: OsString) -> io::Result<Self> {
-        let mut ref_path = PathBuf::from(NETNS_REF_DIR);
-        ref_path.push(&name);
-        let ref_file = OpenOptions::new().read(true).open(ref_path)?;
+        let ref_file = OpenOptions::new().read(true).open(ref_path(&name)?)?;
 
         // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 4
         let mut sock = Socket::new(Protocol::Route)?;
 
         // bind(4, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
-        let _port_number = sock.bind_auto()?.port_number();
+        sock.bind_auto()?;
 
-        let mut packet = NetlinkMessage {
+        let mut req = NetlinkMessage {
             header: NetlinkHeader {
                 flags: NLM_F_REQUEST,
                 sequence_number: 0,
@@ -53,14 +73,14 @@ impl NamedNetns {
                 header: NsidHeader {
                     rtgen_family: AF_UNSPEC as u8,
                 },
-                nlas: vec![nsid::Nla::Fd(ref_file.as_raw_fd() as u32)],
+                nlas: vec![Fd(ref_file.as_raw_fd() as u32)],
             })),
         };
 
-        packet.finalize();
+        req.finalize();
 
         let mut buf = vec![0; 1024 * 8];
-        packet.serialize(&mut buf[..packet.buffer_len()]);
+        req.serialize(&mut buf[..req.buffer_len()]);
         sock.send(&buf, 0)?;
 
         let mut recv_buf = vec![0; 1024 * 8];
@@ -72,7 +92,7 @@ impl NamedNetns {
         let recv_msgbuf = RtnlMessageBuffer::new(&recv_payload);
         match RtnlMessage::parse_with_param(&recv_msgbuf, RTM_NEWNSID) {
             Ok(RtnlMessage::NewNsId(NsidMessage { nlas, .. })) => match nlas.get(0) {
-                Some(nsid::Nla::Id(id)) => Ok(NamedNetns {
+                Some(Id(id)) => Ok(NamedNetns {
                     name: name,
                     nsid: match id {
                         -1 => None,
@@ -96,14 +116,6 @@ impl NamedNetns {
         }
     }
 }
-
-// setsockopt(3, SOL_SOCKET, SO_SNDBUF, [32768], 4) = 0
-// setsockopt(3, SOL_SOCKET, SO_RCVBUF, [1048576], 4) = 0
-// setsockopt(3, SOL_NETLINK, NETLINK_EXT_ACK, [1], 4) = 0
-// bind(3, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
-// sendto(3, {{len=28, type=RTM_GETNSID, flags=NLM_F_REQUEST, seq=0, pid=0}, {rtgen_family=AF_UNSPEC}, {{nla_len=8, nla_type=NETNSA_FD}, 4}}, 28, 0, NULL, 0) = 28
-// recvmsg(3, {msg_name={sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, msg_namelen=12, msg_iov=[{iov_base={{len=28, type=RTM_NEWNSID, flags=0, seq=0, pid=5436}, {rtgen_family=AF_UNSPEC}, {{nla_len=8, nla_type=NETNSA_NSID}, -1}}, iov_len=16384}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 28
-//
 
 fn create_ns(name: &str, veth_prefix: &str) -> io::Result<()> {
     // println!("ip netns add {}", name);
