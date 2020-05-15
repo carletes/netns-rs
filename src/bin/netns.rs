@@ -1,10 +1,12 @@
 use clap::{crate_version, App, AppSettings, Arg, SubCommand};
+use netlink_packet_core::NLMSG_ERROR;
 use netlink_packet_route::{
     nsid::Nla::{Fd, Id},
     traits::ParseableParametrized,
     DecodeError, NetlinkBuffer, NetlinkHeader, NetlinkMessage, NetlinkPayload, NsidHeader,
     NsidMessage, RtnlMessage, RtnlMessageBuffer, AF_UNSPEC, NLM_F_REQUEST, RTM_NEWNSID,
 };
+use netlink_packet_utils::parsers::parse_i32;
 use netlink_sys::{Protocol, Socket};
 use std::convert;
 use std::error;
@@ -53,6 +55,12 @@ impl error::Error for NetnsError {
 impl convert::From<io::Error> for NetnsError {
     fn from(err: io::Error) -> Self {
         NetnsError::IOError(err)
+    }
+}
+
+impl convert::From<DecodeError> for NetnsError {
+    fn from(err: DecodeError) -> Self {
+        NetnsError::NetlinkDecodeError(err)
     }
 }
 
@@ -112,7 +120,6 @@ impl NamedNetns {
                 nlas: vec![Fd(ref_file.as_raw_fd() as u32)],
             })),
         };
-
         req.finalize();
 
         let mut buf = vec![0; 1024 * 8];
@@ -122,13 +129,19 @@ impl NamedNetns {
         let mut recv_buf = vec![0; 1024 * 8];
         sock.recv(&mut recv_buf[..], 0)?;
 
-        let recv_packet = NetlinkBuffer::new_checked(&recv_buf[..])
-            .or_else(|err| Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err))))?;
+        let recv_packet = NetlinkBuffer::new_checked(&recv_buf[..])?;
         let recv_payload = recv_packet.payload();
+
+        if recv_packet.message_type() == NLMSG_ERROR {
+            // Error code in the first 4 octets of payload, and it's negated.
+            let errno = -parse_i32(&recv_payload[..4])?;
+            return Err(NetnsError::IOError(io::Error::from_raw_os_error(errno)));
+        }
+
         let recv_msgbuf = RtnlMessageBuffer::new(&recv_payload);
         match RtnlMessage::parse_with_param(&recv_msgbuf, RTM_NEWNSID) {
             Ok(RtnlMessage::NewNsId(NsidMessage { nlas, .. })) => match nlas.get(0) {
-                Some(Id(id)) => Ok(NamedNetns {
+                Some(Id(id)) => Ok(Self {
                     name: name,
                     nsid: match id {
                         -1 => None,
