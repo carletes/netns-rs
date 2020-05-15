@@ -2,10 +2,12 @@ use clap::{crate_version, App, AppSettings, Arg, SubCommand};
 use netlink_packet_route::{
     nsid::Nla::{Fd, Id},
     traits::ParseableParametrized,
-    NetlinkBuffer, NetlinkHeader, NetlinkMessage, NetlinkPayload, NsidHeader, NsidMessage,
-    RtnlMessage, RtnlMessageBuffer, AF_UNSPEC, NLM_F_REQUEST, RTM_NEWNSID,
+    DecodeError, NetlinkBuffer, NetlinkHeader, NetlinkMessage, NetlinkPayload, NsidHeader,
+    NsidMessage, RtnlMessage, RtnlMessageBuffer, AF_UNSPEC, NLM_F_REQUEST, RTM_NEWNSID,
 };
 use netlink_sys::{Protocol, Socket};
+use std::convert;
+use std::error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{read_dir, OpenOptions};
@@ -13,6 +15,46 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process;
+
+#[derive(Debug)]
+enum NetnsError {
+    InvalidName(OsString),
+    IOError(io::Error),
+    MissingNsIdAttribute,
+    NetlinkDecodeError(DecodeError),
+    UnexpectedNetlinkAttribute,
+    UnexpectedNetlinkResponse,
+}
+
+impl fmt::Display for NetnsError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::InvalidName(name) => {
+                write!(f, "Invalid namespace name '{}'", name.to_string_lossy())
+            }
+            Self::IOError(err) => err.fmt(f),
+            Self::MissingNsIdAttribute => write!(f, "Missing nsid attribute"),
+            Self::NetlinkDecodeError(err) => err.fmt(f),
+            Self::UnexpectedNetlinkAttribute => write!(f, "Unexpected netlink attribute"),
+            Self::UnexpectedNetlinkResponse => write!(f, "Unexpected netlink response"),
+        }
+    }
+}
+
+impl error::Error for NetnsError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::IOError(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl convert::From<io::Error> for NetnsError {
+    fn from(err: io::Error) -> Self {
+        NetnsError::IOError(err)
+    }
+}
 
 struct NamedNetns {
     name: OsString,
@@ -32,7 +74,7 @@ impl fmt::Display for NamedNetns {
 
 static NETNS_REF_DIR: &str = "/var/run/netns";
 
-fn ref_path(name: &OsString) -> io::Result<PathBuf> {
+fn ref_path(name: &OsString) -> Result<PathBuf, NetnsError> {
     let mut path = PathBuf::from(NETNS_REF_DIR);
     path.push(name);
     match path.parent() {
@@ -40,21 +82,15 @@ fn ref_path(name: &OsString) -> io::Result<PathBuf> {
             if p.as_os_str() == NETNS_REF_DIR {
                 Ok(path)
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Invalid namespace name {}", name.to_string_lossy()),
-                ))
+                Err(NetnsError::InvalidName(name.clone()))
             }
         }
-        None => Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Invalid namespace name {}", name.to_string_lossy()),
-        )),
+        None => Err(NetnsError::InvalidName(name.clone())),
     }
 }
 
 impl NamedNetns {
-    fn new(name: OsString) -> io::Result<Self> {
+    fn from_name(name: OsString) -> Result<Self, NetnsError> {
         let ref_file = OpenOptions::new().read(true).open(ref_path(&name)?)?;
 
         // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 4
@@ -99,25 +135,16 @@ impl NamedNetns {
                         _ => Some(*id),
                     },
                 }),
-                Some(unexpected) => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Unexpected netlink attribute: {:?}", unexpected),
-                )),
-                None => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "No nsid attribute returned",
-                )),
+                Some(_unexpected) => Err(NetnsError::UnexpectedNetlinkAttribute),
+                None => Err(NetnsError::MissingNsIdAttribute),
             },
-            Ok(unexpected) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Unexpected netlink response: {:?}", unexpected),
-            )),
-            Err(err) => Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err))),
+            Ok(_unexpected) => Err(NetnsError::UnexpectedNetlinkResponse),
+            Err(err) => Err(NetnsError::NetlinkDecodeError(err)),
         }
     }
 }
 
-fn create_ns(name: &str, veth_prefix: &str) -> io::Result<()> {
+fn create_ns(name: &str, veth_prefix: &str) -> Result<(), NetnsError> {
     // println!("ip netns add {}", name);
     let mut ref_path = PathBuf::from(NETNS_REF_DIR);
     ref_path.push(name);
@@ -134,15 +161,19 @@ fn create_ns(name: &str, veth_prefix: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn list_netns() -> io::Result<()> {
+fn list_netns() -> Result<(), NetnsError> {
     match read_dir(OsStr::new(NETNS_REF_DIR)) {
         Ok(rd) => {
             for entry in rd {
                 let entry = entry?;
 
-                match NamedNetns::new(entry.file_name()) {
+                match NamedNetns::from_name(entry.file_name()) {
                     Ok(ns) => println!("{}", ns),
-                    Err(err) => eprintln!("{}", err),
+                    Err(err) => eprintln!(
+                        "Invalid namespace reference '{}': {}",
+                        entry.path().to_string_lossy(),
+                        err
+                    ),
                 }
             }
             Ok(())
@@ -151,7 +182,7 @@ fn list_netns() -> io::Result<()> {
             if err.kind() == io::ErrorKind::NotFound {
                 Ok(())
             } else {
-                Err(err)
+                Err(NetnsError::IOError(err))
             }
         }
     }
