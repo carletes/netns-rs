@@ -8,6 +8,8 @@ use netlink_packet_route::{
 };
 use netlink_packet_utils::parsers::parse_i32;
 use netlink_sys::{Protocol, Socket};
+use nix::mount::{mount, MsFlags};
+use nix::sched::{setns, unshare, CloneFlags};
 use std::convert;
 use std::error;
 use std::ffi::{OsStr, OsString};
@@ -97,7 +99,53 @@ fn ref_path(name: &OsString) -> Result<PathBuf, NetnsError> {
     }
 }
 
+fn ensure_shared_mount_point() -> io::Result<()> {
+    Ok(())
+}
+
 impl NamedNetns {
+    fn create(name: OsString) -> Result<Self, NetnsError> {
+        ensure_shared_mount_point()?;
+        let ref_path_name = ref_path(&name)?;
+
+        let orig_netns = OpenOptions::new().read(true).open("/proc/self/ns/net")?;
+        let mut orig_netns_changed = false;
+
+        let go = || {
+            let ref_file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(ref_path_name)?;
+
+            unshare(CloneFlags::CLONE_NEWNET)?;
+            orig_netns_changed = true;
+
+            mount(
+                Some("/proc/self/ns/net"),
+                Some(ref_path_name),
+                None,
+                MsFlags::MS_BIND,
+                None,
+            )?;
+
+            setns(orig_netns, CloneFlags::CLONE_NEWNET)?;
+            orig_netns_changed = false;
+
+            Self::from_name(name)
+        };
+
+        match go() {
+            Ok(ns) => Ok(ns),
+            Err(err) => {
+                if orig_netns_changed {
+                    setns(prev_netns, CloneFlags::CLONE_NEWNET);
+                }
+                // unlink(ref_path_name);
+                Err(err)
+            }
+        }
+    }
+
     fn from_name(name: OsString) -> Result<Self, NetnsError> {
         let ref_file = OpenOptions::new().read(true).open(ref_path(&name)?)?;
 
