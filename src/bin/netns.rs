@@ -157,6 +157,77 @@ impl NamedNetns {
     }
 }
 
+/* Make it possible for network namespace mounts to propagate between
+ * mount namespaces.  This makes it likely that a unmounting a network
+ * namespace file in one namespace will unmount the network namespace
+ * file in all namespaces allowing the network namespace to be freed
+ * sooner.
+ */
+// 1. Change the propagation type of NETNS_RUN_DIR. Source, fstype and data are ignored, so
+//    this is in practical terms:
+//
+//        mount(/* ignored */, NETNS_RUN_DIR, /* ignored */, MS_SHARED | MS_REC, /* ignored */)
+//
+//    MS_SHARED: Make this mount point shared. Mount and unmount events immediately under this
+//               mount point will propagate to the other mount points that are members of this
+//               mount's peer group.
+//
+//    MS_REC: Also change the propagation type of all mount points under NETNS_RUN_DIR.
+//
+// while (mount("", NETNS_RUN_DIR, "none", MS_SHARED | MS_REC, NULL)) {
+//         [> Fail unless we need to make the mount point <]
+//         if (errno != EINVAL || made_netns_run_dir_mount) {
+//                 fprintf(stderr, "mount --make-shared %s failed: %s\n",
+//                         NETNS_RUN_DIR, strerror(errno));
+//                 return -1;
+//         }
+//
+//         2. Do a bind mount of NETNS_RUN_DIR onto itself. fstype and data are ignored, so
+//            this is in practical terms:
+//
+//                mount(NETNS_RUN_DIR, NETNS_RUN_DIR, /* ignored */, MS_BIND | MS_REC, /* ignored */)
+//
+//            MS_REC: Recursively bind-mount all submounts under NETNS_RUN_DIR.
+//
+//         [> Upgrade NETNS_RUN_DIR to a mount point <]
+//         if (mount(NETNS_RUN_DIR, NETNS_RUN_DIR, "none", MS_BIND | MS_REC, NULL)) {
+//                 fprintf(stderr, "mount --bind %s %s failed: %s\n",
+//                         NETNS_RUN_DIR, NETNS_RUN_DIR, strerror(errno));
+//                 return -1;
+//         }
+//         made_netns_run_dir_mount = 1;
+// }
+// [> Create the filesystem state <]
+// fd = open(netns_path, O_RDONLY|O_CREAT|O_EXCL, 0);
+// if (fd < 0) {
+//         fprintf(stderr, "Cannot create namespace file \"%s\": %s\n",
+//                 netns_path, strerror(errno));
+//         return -1;
+// }
+// close(fd);
+//
+// if (create) {
+//         netns_save();
+//         if (unshare(CLONE_NEWNET) < 0) {
+//                 fprintf(stderr, "Failed to create a new network namespace \"%s\": %s\n",
+//                         name, strerror(errno));
+//                 goto out_delete;
+//         }
+//
+//         strcpy(proc_path, "/proc/self/ns/net");
+// } else {
+//         snprintf(proc_path, sizeof(proc_path), "/proc/%d/ns/net", pid);
+// }
+//
+// [> Bind the netns last so I can watch for it <]
+// if (mount(proc_path, netns_path, "none", MS_BIND, NULL) < 0) {
+//         fprintf(stderr, "Bind %s -> %s failed: %s\n",
+//                 proc_path, netns_path, strerror(errno));
+//         goto out_delete;
+// }
+// netns_restore();
+//
+
 fn create_ns(name: &str, veth_prefix: &str) -> Result<(), NetnsError> {
     // println!("ip netns add {}", name);
     let mut ref_path = PathBuf::from(NETNS_REF_DIR);
