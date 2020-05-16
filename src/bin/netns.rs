@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use clap::{crate_version, App, AppSettings, Arg, SubCommand};
 use netlink_packet_core::NLMSG_ERROR;
 use netlink_packet_route::{
@@ -12,69 +13,38 @@ use nix;
 use nix::mount::{mount, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
 use std::convert;
-use std::error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{create_dir_all, read_dir, OpenOptions};
+use std::fs::{create_dir_all, read_dir, remove_file, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::process;
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 enum NetnsError {
+    #[error("Invalid namespace name {0:?}")]
     InvalidName(OsString),
-    IOError(io::Error),
+
+    #[error(transparent)]
+    IOError(#[from] io::Error),
+
+    #[error("Missing netlink nsid attribute")]
     MissingNsIdAttribute,
+
+    #[error("Netlink decoding error")]
     NetlinkDecodeError(DecodeError),
+
+    #[error("Unexpected netlink attribute")]
     UnexpectedNetlinkAttribute,
+
+    #[error("Unexpected netlink response")]
     UnexpectedNetlinkResponse,
-    UnknownError,
-}
-
-impl fmt::Display for NetnsError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::InvalidName(name) => {
-                write!(f, "Invalid namespace name '{}'", name.to_string_lossy())
-            }
-            Self::IOError(err) => err.fmt(f),
-            Self::MissingNsIdAttribute => write!(f, "Missing nsid attribute"),
-            Self::NetlinkDecodeError(err) => err.fmt(f),
-            Self::UnexpectedNetlinkAttribute => write!(f, "Unexpected netlink attribute"),
-            Self::UnexpectedNetlinkResponse => write!(f, "Unexpected netlink response"),
-            Self::UnknownError => write!(f, "Unknown error"),
-        }
-    }
-}
-
-impl error::Error for NetnsError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Self::IOError(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl convert::From<io::Error> for NetnsError {
-    fn from(err: io::Error) -> Self {
-        NetnsError::IOError(err)
-    }
 }
 
 impl convert::From<DecodeError> for NetnsError {
     fn from(err: DecodeError) -> Self {
         NetnsError::NetlinkDecodeError(err)
-    }
-}
-
-impl convert::From<nix::Error> for NetnsError {
-    fn from(err: nix::Error) -> Self {
-        match err {
-            nix::Error::Sys(errno) => Self::IOError(errno.into()),
-            _ => Self::UnknownError,
-        }
     }
 }
 
@@ -96,7 +66,7 @@ impl fmt::Display for NamedNetns {
 
 static NETNS_REF_DIR: &str = "/var/run/netns";
 
-fn ref_path(name: &OsString) -> Result<PathBuf, NetnsError> {
+fn ref_path(name: &OsString) -> Result<PathBuf> {
     let mut path = PathBuf::from(NETNS_REF_DIR);
     path.push(name);
     match path.parent() {
@@ -104,10 +74,10 @@ fn ref_path(name: &OsString) -> Result<PathBuf, NetnsError> {
             if p.as_os_str() == NETNS_REF_DIR {
                 Ok(path)
             } else {
-                Err(NetnsError::InvalidName(name.clone()))
+                Err(NetnsError::InvalidName(name.clone()).into())
             }
         }
-        None => Err(NetnsError::InvalidName(name.clone())),
+        None => Err(NetnsError::InvalidName(name.clone()).into()),
     }
 }
 
@@ -125,30 +95,28 @@ fn remount_shared_rec(path: &str) -> io::Result<()> {
 
 fn ensure_shared_mount_point() -> io::Result<()> {
     create_dir_all(NETNS_REF_DIR)?;
-    remount_shared_rec(NETNS_REF_DIR).or_else(|err: io::Error| -> io::Result<()> {
-        match err.kind() {
-            io::ErrorKind::InvalidInput => {
-                let mut flags = MsFlags::empty();
-                flags.set(MsFlags::MS_BIND, true);
-                flags.set(MsFlags::MS_REC, true);
-                mount(Some(NETNS_REF_DIR), NETNS_REF_DIR, NONE, flags, NONE).or_else(|err| {
-                    match err {
-                        nix::Error::Sys(errno) => Err(errno.into()),
-                        _ => Err(io::Error::new(io::ErrorKind::Other, "Unknwon error")),
-                    }
-                })?;
+    remount_shared_rec(NETNS_REF_DIR).or_else(|err| match err.kind() {
+        io::ErrorKind::InvalidInput => {
+            let mut flags = MsFlags::empty();
+            flags.set(MsFlags::MS_BIND, true);
+            flags.set(MsFlags::MS_REC, true);
+            mount(Some(NETNS_REF_DIR), NETNS_REF_DIR, NONE, flags, NONE).or_else(
+                |err| match err {
+                    nix::Error::Sys(errno) => Err(errno.into()),
+                    _ => Err(io::Error::new(io::ErrorKind::Other, "Unknwon error")),
+                },
+            )?;
 
-                remount_shared_rec(NETNS_REF_DIR)
-            }
-            otherwise => Err(otherwise.into()),
+            remount_shared_rec(NETNS_REF_DIR)
         }
+        otherwise => Err(otherwise.into()),
     })
 }
 
 const NONE: Option<&'static [u8]> = None;
 
 impl NamedNetns {
-    fn create(name: &str) -> Result<Self, NetnsError> {
+    fn create(name: &str) -> Result<Self> {
         ensure_shared_mount_point()?;
 
         let name = OsString::from(name);
@@ -187,13 +155,16 @@ impl NamedNetns {
                     setns(orig_netns.as_raw_fd(), CloneFlags::CLONE_NEWNET)
                         .expect("cannot switch back to original network namespace");
                 }
-                // unlink(ref_path_name);
+                remove_file(&ref_path_name).expect(&format!(
+                    "cannot remove namespace reference {}",
+                    ref_path_name.to_string_lossy()
+                ));
                 Err(err)
             }
         }
     }
 
-    fn from_name(name: OsString) -> Result<Self, NetnsError> {
+    fn from_name(name: OsString) -> Result<Self> {
         let ref_file = OpenOptions::new().read(true).open(ref_path(&name)?)?;
 
         // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 4
@@ -224,13 +195,15 @@ impl NamedNetns {
         let mut recv_buf = vec![0; 1024 * 8];
         sock.recv(&mut recv_buf[..], 0)?;
 
-        let recv_packet = NetlinkBuffer::new_checked(&recv_buf[..])?;
+        let recv_packet = NetlinkBuffer::new_checked(&recv_buf[..])
+            .map_err(|err| -> NetnsError { err.into() })?;
         let recv_payload = recv_packet.payload();
 
         if recv_packet.message_type() == NLMSG_ERROR {
             // Error code in the first 4 octets of payload, and it's negated.
-            let errno = -parse_i32(&recv_payload[..4])?;
-            return Err(NetnsError::IOError(io::Error::from_raw_os_error(errno)));
+            let errno =
+                -parse_i32(&recv_payload[..4]).map_err(|err| -> NetnsError { err.into() })?;
+            return Err(io::Error::from_raw_os_error(errno).into());
         }
 
         let recv_msgbuf = RtnlMessageBuffer::new(&recv_payload);
@@ -243,23 +216,23 @@ impl NamedNetns {
                         _ => Some(*id),
                     },
                 }),
-                Some(_unexpected) => Err(NetnsError::UnexpectedNetlinkAttribute),
-                None => Err(NetnsError::MissingNsIdAttribute),
+                Some(_unexpected) => Err(NetnsError::UnexpectedNetlinkAttribute.into()),
+                None => Err(NetnsError::MissingNsIdAttribute.into()),
             },
-            Ok(_unexpected) => Err(NetnsError::UnexpectedNetlinkResponse),
-            Err(err) => Err(NetnsError::NetlinkDecodeError(err)),
+            Ok(_unexpected) => Err(NetnsError::UnexpectedNetlinkResponse.into()),
+            Err(err) => Err(NetnsError::NetlinkDecodeError(err).into()),
         }
     }
 }
 
-fn create_ns(name: &str) -> Result<(), NetnsError> {
-    NamedNetns::create(name)?;
+fn create_ns(name: &str) -> Result<()> {
+    NamedNetns::create(name).with_context(|| format!("Cannot create namespace {}", name))?;
     Ok(())
 }
 
-fn list_netns() -> Result<(), NetnsError> {
-    match read_dir(OsStr::new(NETNS_REF_DIR)) {
-        Ok(rd) => {
+fn list_netns() -> Result<()> {
+    read_dir(OsStr::new(NETNS_REF_DIR))
+        .and_then(|rd| {
             for entry in rd {
                 let entry = entry?;
 
@@ -273,18 +246,17 @@ fn list_netns() -> Result<(), NetnsError> {
                 }
             }
             Ok(())
-        }
-        Err(err) => {
+        })
+        .or_else(|err| {
             if err.kind() == io::ErrorKind::NotFound {
                 Ok(())
             } else {
-                Err(NetnsError::IOError(err))
+                Err(err.into())
             }
-        }
-    }
+        })
 }
 
-fn main() {
+fn main() -> Result<()> {
     let matches = App::new("netns")
         .version(crate_version!())
         .setting(AppSettings::SubcommandRequired)
@@ -316,22 +288,10 @@ fn main() {
     match matches.subcommand_name() {
         Some("create") => {
             let matches = matches.subcommand_matches("create").unwrap();
-            match create_ns(matches.value_of("name").unwrap()) {
-                Ok(_) => process::exit(0),
-                Err(err) => {
-                    eprintln!("Error: {}", err);
-                    process::exit(1);
-                }
-            }
+            create_ns(matches.value_of("name").unwrap())
         }
-        Some("delete") => {}
-        Some("list") => match list_netns() {
-            Ok(_) => process::exit(0),
-            Err(err) => {
-                eprintln!("Error: {}", err);
-                process::exit(1);
-            }
-        },
+        Some("delete") => Ok(()),
+        Some("list") => list_netns(),
         _ => {
             unreachable!();
         }
