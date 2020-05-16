@@ -8,13 +8,14 @@ use netlink_packet_route::{
 };
 use netlink_packet_utils::parsers::parse_i32;
 use netlink_sys::{Protocol, Socket};
+use nix;
 use nix::mount::{mount, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
 use std::convert;
 use std::error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{read_dir, OpenOptions};
+use std::fs::{create_dir_all, read_dir, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -28,6 +29,7 @@ enum NetnsError {
     NetlinkDecodeError(DecodeError),
     UnexpectedNetlinkAttribute,
     UnexpectedNetlinkResponse,
+    UnknownError,
 }
 
 impl fmt::Display for NetnsError {
@@ -41,6 +43,7 @@ impl fmt::Display for NetnsError {
             Self::NetlinkDecodeError(err) => err.fmt(f),
             Self::UnexpectedNetlinkAttribute => write!(f, "Unexpected netlink attribute"),
             Self::UnexpectedNetlinkResponse => write!(f, "Unexpected netlink response"),
+            Self::UnknownError => write!(f, "Unknown error"),
         }
     }
 }
@@ -63,6 +66,15 @@ impl convert::From<io::Error> for NetnsError {
 impl convert::From<DecodeError> for NetnsError {
     fn from(err: DecodeError) -> Self {
         NetnsError::NetlinkDecodeError(err)
+    }
+}
+
+impl convert::From<nix::Error> for NetnsError {
+    fn from(err: nix::Error) -> Self {
+        match err {
+            nix::Error::Sys(errno) => Self::IOError(errno.into()),
+            _ => Self::UnknownError,
+        }
     }
 }
 
@@ -99,46 +111,81 @@ fn ref_path(name: &OsString) -> Result<PathBuf, NetnsError> {
     }
 }
 
-fn ensure_shared_mount_point() -> io::Result<()> {
-    Ok(())
+fn remount_shared_rec(path: &str) -> io::Result<()> {
+    let mut flags = MsFlags::empty();
+    flags.set(MsFlags::MS_SHARED, true);
+    flags.set(MsFlags::MS_REC, true);
+    mount(NONE, path, NONE, flags, NONE).or_else(|err| -> io::Result<()> {
+        match err {
+            nix::Error::Sys(errno) => Err(errno.into()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, "Unknwon error")),
+        }
+    })
 }
 
+fn ensure_shared_mount_point() -> io::Result<()> {
+    create_dir_all(NETNS_REF_DIR)?;
+    remount_shared_rec(NETNS_REF_DIR).or_else(|err: io::Error| -> io::Result<()> {
+        match err.kind() {
+            io::ErrorKind::InvalidInput => {
+                let mut flags = MsFlags::empty();
+                flags.set(MsFlags::MS_BIND, true);
+                flags.set(MsFlags::MS_REC, true);
+                mount(Some(NETNS_REF_DIR), NETNS_REF_DIR, NONE, flags, NONE).or_else(|err| {
+                    match err {
+                        nix::Error::Sys(errno) => Err(errno.into()),
+                        _ => Err(io::Error::new(io::ErrorKind::Other, "Unknwon error")),
+                    }
+                })?;
+
+                remount_shared_rec(NETNS_REF_DIR)
+            }
+            otherwise => Err(otherwise.into()),
+        }
+    })
+}
+
+const NONE: Option<&'static [u8]> = None;
+
 impl NamedNetns {
-    fn create(name: OsString) -> Result<Self, NetnsError> {
+    fn create(name: &str) -> Result<Self, NetnsError> {
         ensure_shared_mount_point()?;
+
+        let name = OsString::from(name);
         let ref_path_name = ref_path(&name)?;
 
         let orig_netns = OpenOptions::new().read(true).open("/proc/self/ns/net")?;
         let mut orig_netns_changed = false;
 
-        let go = || {
-            let ref_file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(ref_path_name)?;
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&ref_path_name)?;
 
+        let go = |ref_path_name| {
             unshare(CloneFlags::CLONE_NEWNET)?;
             orig_netns_changed = true;
 
             mount(
                 Some("/proc/self/ns/net"),
-                Some(ref_path_name),
-                None,
+                ref_path_name,
+                NONE,
                 MsFlags::MS_BIND,
-                None,
+                NONE,
             )?;
 
-            setns(orig_netns, CloneFlags::CLONE_NEWNET)?;
+            setns(orig_netns.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
             orig_netns_changed = false;
 
             Self::from_name(name)
         };
 
-        match go() {
+        match go(&ref_path_name) {
             Ok(ns) => Ok(ns),
             Err(err) => {
                 if orig_netns_changed {
-                    setns(prev_netns, CloneFlags::CLONE_NEWNET);
+                    setns(orig_netns.as_raw_fd(), CloneFlags::CLONE_NEWNET)
+                        .expect("cannot switch back to original network namespace");
                 }
                 // unlink(ref_path_name);
                 Err(err)
@@ -205,91 +252,8 @@ impl NamedNetns {
     }
 }
 
-/* Make it possible for network namespace mounts to propagate between
- * mount namespaces.  This makes it likely that a unmounting a network
- * namespace file in one namespace will unmount the network namespace
- * file in all namespaces allowing the network namespace to be freed
- * sooner.
- */
-// 1. Change the propagation type of NETNS_RUN_DIR. Source, fstype and data are ignored, so
-//    this is in practical terms:
-//
-//        mount(/* ignored */, NETNS_RUN_DIR, /* ignored */, MS_SHARED | MS_REC, /* ignored */)
-//
-//    MS_SHARED: Make this mount point shared. Mount and unmount events immediately under this
-//               mount point will propagate to the other mount points that are members of this
-//               mount's peer group.
-//
-//    MS_REC: Also change the propagation type of all mount points under NETNS_RUN_DIR.
-//
-// while (mount("", NETNS_RUN_DIR, "none", MS_SHARED | MS_REC, NULL)) {
-//         [> Fail unless we need to make the mount point <]
-//         if (errno != EINVAL || made_netns_run_dir_mount) {
-//                 fprintf(stderr, "mount --make-shared %s failed: %s\n",
-//                         NETNS_RUN_DIR, strerror(errno));
-//                 return -1;
-//         }
-//
-//         2. Do a bind mount of NETNS_RUN_DIR onto itself. fstype and data are ignored, so
-//            this is in practical terms:
-//
-//                mount(NETNS_RUN_DIR, NETNS_RUN_DIR, /* ignored */, MS_BIND | MS_REC, /* ignored */)
-//
-//            MS_REC: Recursively bind-mount all submounts under NETNS_RUN_DIR.
-//
-//         [> Upgrade NETNS_RUN_DIR to a mount point <]
-//         if (mount(NETNS_RUN_DIR, NETNS_RUN_DIR, "none", MS_BIND | MS_REC, NULL)) {
-//                 fprintf(stderr, "mount --bind %s %s failed: %s\n",
-//                         NETNS_RUN_DIR, NETNS_RUN_DIR, strerror(errno));
-//                 return -1;
-//         }
-//         made_netns_run_dir_mount = 1;
-// }
-// [> Create the filesystem state <]
-// fd = open(netns_path, O_RDONLY|O_CREAT|O_EXCL, 0);
-// if (fd < 0) {
-//         fprintf(stderr, "Cannot create namespace file \"%s\": %s\n",
-//                 netns_path, strerror(errno));
-//         return -1;
-// }
-// close(fd);
-//
-// if (create) {
-//         netns_save();
-//         if (unshare(CLONE_NEWNET) < 0) {
-//                 fprintf(stderr, "Failed to create a new network namespace \"%s\": %s\n",
-//                         name, strerror(errno));
-//                 goto out_delete;
-//         }
-//
-//         strcpy(proc_path, "/proc/self/ns/net");
-// } else {
-//         snprintf(proc_path, sizeof(proc_path), "/proc/%d/ns/net", pid);
-// }
-//
-// [> Bind the netns last so I can watch for it <]
-// if (mount(proc_path, netns_path, "none", MS_BIND, NULL) < 0) {
-//         fprintf(stderr, "Bind %s -> %s failed: %s\n",
-//                 proc_path, netns_path, strerror(errno));
-//         goto out_delete;
-// }
-// netns_restore();
-//
-
-fn create_ns(name: &str, veth_prefix: &str) -> Result<(), NetnsError> {
-    // println!("ip netns add {}", name);
-    let mut ref_path = PathBuf::from(NETNS_REF_DIR);
-    ref_path.push(name);
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(ref_path)?;
-
-    let veth_dev = format!("{}XX", veth_prefix);
-    let veth_peer = format!("{}YY", veth_prefix);
-    println!("ip link add {} type veth peer {}", veth_dev, veth_peer);
-    println!("ip link set {} netns {}", veth_peer, name);
-
+fn create_ns(name: &str) -> Result<(), NetnsError> {
+    NamedNetns::create(name)?;
     Ok(())
 }
 
@@ -328,26 +292,6 @@ fn main() {
             SubCommand::with_name("create")
                 .about("Creates a named network namespace")
                 .arg(
-                    Arg::with_name("veth-prefix")
-                        .value_name("PREFIX")
-                        .long("veth-prefix")
-                        .help("Base prefix of the veth device pair")
-                        .default_value("veth"),
-                )
-                .arg(
-                    Arg::with_name("veth-address")
-                        .value_name("ADDR/PREFIX")
-                        .long("veth-address")
-                        .help("IPv4 address of the veth device in the current network namespace"),
-                )
-                .arg(
-                    Arg::with_name("veth-peer-address")
-                        .value_name("ADDR/PREFIX")
-                        .long("veth-peer-address")
-                        .help("IPv4 address of the veth device in the new network namespace")
-                        .default_value("10.1.1.1/24"),
-                )
-                .arg(
                     Arg::with_name("name")
                         .value_name("NAME")
                         .help("Name of the new network namespace")
@@ -372,13 +316,10 @@ fn main() {
     match matches.subcommand_name() {
         Some("create") => {
             let matches = matches.subcommand_matches("create").unwrap();
-            match create_ns(
-                matches.value_of("name").unwrap(),
-                matches.value_of("veth-prefix").unwrap(),
-            ) {
+            match create_ns(matches.value_of("name").unwrap()) {
                 Ok(_) => process::exit(0),
                 Err(err) => {
-                    eprintln!("Error: {:?}", err);
+                    eprintln!("Error: {}", err);
                     process::exit(1);
                 }
             }
@@ -387,7 +328,7 @@ fn main() {
         Some("list") => match list_netns() {
             Ok(_) => process::exit(0),
             Err(err) => {
-                eprintln!("Error: {:?}", err);
+                eprintln!("Error: {}", err);
                 process::exit(1);
             }
         },
