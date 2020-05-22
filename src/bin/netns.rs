@@ -84,17 +84,18 @@ fn ref_path(name: &OsString) -> Result<PathBuf> {
 fn ensure_shared_mount_point() -> Result<()> {
     create_dir_all(NETNS_REF_DIR)?;
 
-    fn remount_shared_rec(path: &str) -> io::Result<()> {
-        let mut flags = MsFlags::empty();
-        flags.set(MsFlags::MS_SHARED, true);
-        flags.set(MsFlags::MS_REC, true);
-        mount(NONE, path, NONE, flags, NONE).or_else(|err| -> io::Result<()> {
+    let mut remount_flags = MsFlags::empty();
+    remount_flags.set(MsFlags::MS_SHARED, true);
+    remount_flags.set(MsFlags::MS_REC, true);
+
+    let remount_shared_rec = |path: &str| -> io::Result<()> {
+        mount(NONE, path, NONE, remount_flags, NONE).or_else(|err| -> io::Result<()> {
             match err {
                 nix::Error::Sys(errno) => Err(errno.into()),
                 _ => Err(io::Error::new(io::ErrorKind::Other, "Unknwon error")),
             }
         })
-    }
+    };
 
     remount_shared_rec(NETNS_REF_DIR).or_else(|err| match err.kind() {
         io::ErrorKind::InvalidInput => {
@@ -250,10 +251,36 @@ impl NamedNetns {
             Err(err) => Err(NetnsError::NetlinkDecodeError(err).into()),
         }
     }
+
+    fn delete(name: &str) -> Result<()> {
+        let name = OsString::from(name);
+        let ref_path_name = ref_path(&name)?;
+
+        fn unmount_ref(ref_path_name: &PathBuf) -> Result<()> {
+            umount2(ref_path_name, MntFlags::MNT_DETACH)?;
+            Ok(())
+        }
+
+        fn remove_ref(ref_path_name: &PathBuf) -> Result<()> {
+            remove_file(ref_path_name)?;
+            Ok(())
+        }
+
+        unmount_ref(&ref_path_name)
+            .with_context(|| format!("Cannot unmount {}", ref_path_name.to_string_lossy()))?;
+
+        remove_ref(&ref_path_name)
+            .with_context(|| format!("Cannot remove {}", ref_path_name.to_string_lossy()))
+    }
 }
 
 fn create_ns(name: &str) -> Result<()> {
     NamedNetns::create(name).with_context(|| format!("Cannot create namespace {}", name))?;
+    Ok(())
+}
+
+fn delete_ns(name: &str) -> Result<()> {
+    NamedNetns::delete(name).with_context(|| format!("Cannot delete namespace {}", name))?;
     Ok(())
 }
 
@@ -317,7 +344,10 @@ fn main() -> Result<()> {
             let matches = matches.subcommand_matches("create").unwrap();
             create_ns(matches.value_of("name").unwrap())
         }
-        Some("delete") => Ok(()),
+        Some("delete") => {
+            let matches = matches.subcommand_matches("delete").unwrap();
+            delete_ns(matches.value_of("name").unwrap())
+        }
         Some("list") => list_netns(),
         _ => {
             unreachable!();
