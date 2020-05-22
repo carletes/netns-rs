@@ -10,14 +10,14 @@ use netlink_packet_route::{
 use netlink_packet_utils::parsers::parse_i32;
 use netlink_sys::{Protocol, Socket};
 use nix;
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
 use std::convert;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{create_dir_all, read_dir, remove_file, OpenOptions};
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -81,20 +81,21 @@ fn ref_path(name: &OsString) -> Result<PathBuf> {
     }
 }
 
-fn remount_shared_rec(path: &str) -> io::Result<()> {
-    let mut flags = MsFlags::empty();
-    flags.set(MsFlags::MS_SHARED, true);
-    flags.set(MsFlags::MS_REC, true);
-    mount(NONE, path, NONE, flags, NONE).or_else(|err| -> io::Result<()> {
-        match err {
-            nix::Error::Sys(errno) => Err(errno.into()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Unknwon error")),
-        }
-    })
-}
-
-fn ensure_shared_mount_point() -> io::Result<()> {
+fn ensure_shared_mount_point() -> Result<()> {
     create_dir_all(NETNS_REF_DIR)?;
+
+    fn remount_shared_rec(path: &str) -> io::Result<()> {
+        let mut flags = MsFlags::empty();
+        flags.set(MsFlags::MS_SHARED, true);
+        flags.set(MsFlags::MS_REC, true);
+        mount(NONE, path, NONE, flags, NONE).or_else(|err| -> io::Result<()> {
+            match err {
+                nix::Error::Sys(errno) => Err(errno.into()),
+                _ => Err(io::Error::new(io::ErrorKind::Other, "Unknwon error")),
+            }
+        })
+    }
+
     remount_shared_rec(NETNS_REF_DIR).or_else(|err| match err.kind() {
         io::ErrorKind::InvalidInput => {
             let mut flags = MsFlags::empty();
@@ -110,30 +111,44 @@ fn ensure_shared_mount_point() -> io::Result<()> {
             remount_shared_rec(NETNS_REF_DIR)
         }
         otherwise => Err(otherwise.into()),
-    })
+    })?;
+
+    Ok(())
 }
 
 const NONE: Option<&'static [u8]> = None;
 
 impl NamedNetns {
     fn create(name: &str) -> Result<Self> {
-        ensure_shared_mount_point()?;
+        ensure_shared_mount_point().with_context(|| format!("Cannot mount {}", NETNS_REF_DIR))?;
 
         let name = OsString::from(name);
         let ref_path_name = ref_path(&name)?;
 
         let orig_netns = OpenOptions::new().read(true).open("/proc/self/ns/net")?;
-        let mut orig_netns_changed = false;
 
-        OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&ref_path_name)?;
+        fn create_netns_ref(ref_path_name: &PathBuf) -> Result<()> {
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(ref_path_name)?;
 
-        let go = |ref_path_name| {
+            Ok(())
+        }
+
+        fn create_netns() -> Result<()> {
             unshare(CloneFlags::CLONE_NEWNET)?;
-            orig_netns_changed = true;
 
+            Ok(())
+        }
+
+        fn restore_netns(fd: RawFd) -> Result<()> {
+            setns(fd, CloneFlags::CLONE_NEWNET)?;
+
+            Ok(())
+        }
+
+        fn mount_netns_ref(ref_path_name: &PathBuf) -> Result<()> {
             mount(
                 Some("/proc/self/ns/net"),
                 ref_path_name,
@@ -142,26 +157,38 @@ impl NamedNetns {
                 NONE,
             )?;
 
-            setns(orig_netns.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
-            orig_netns_changed = false;
-
-            Self::from_name(name)
-        };
-
-        match go(&ref_path_name) {
-            Ok(ns) => Ok(ns),
-            Err(err) => {
-                if orig_netns_changed {
-                    setns(orig_netns.as_raw_fd(), CloneFlags::CLONE_NEWNET)
-                        .expect("cannot switch back to original network namespace");
-                }
-                remove_file(&ref_path_name).expect(&format!(
-                    "cannot remove namespace reference {}",
-                    ref_path_name.to_string_lossy()
-                ));
-                Err(err)
-            }
+            Ok(())
         }
+
+        create_netns_ref(&ref_path_name)
+            .with_context(|| format!("Cannot create {}", ref_path_name.to_string_lossy()))
+            .and_then(|_| {
+                create_netns()
+                    .context("Cannot switch to new network namespace")
+                    .and_then(|_| {
+                        mount_netns_ref(&ref_path_name)
+                            .with_context(|| {
+                                format!("Cannot mount {}", ref_path_name.to_string_lossy())
+                            })
+                            .and_then(|_| {
+                                restore_netns(orig_netns.as_raw_fd())
+                                    .context("Error switching back to original network namespace")
+                                    .and_then(|_| Self::from_name(name))
+                                    .or_else(|err| {
+                                        umount2(&ref_path_name, MntFlags::MNT_DETACH)?;
+                                        Err(err)
+                                    })
+                            })
+                            .or_else(|err| {
+                                restore_netns(orig_netns.as_raw_fd())?;
+                                Err(err)
+                            })
+                    })
+                    .or_else(|err| {
+                        remove_file(&ref_path_name)?;
+                        Err(err)
+                    })
+            })
     }
 
     fn from_name(name: OsString) -> Result<Self> {
