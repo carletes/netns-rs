@@ -9,7 +9,6 @@ use netlink_packet_route::{
 };
 use netlink_packet_utils::parsers::parse_i32;
 use netlink_sys::{Protocol, Socket};
-use nix;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
 use std::convert;
@@ -238,7 +237,7 @@ impl NamedNetns {
         match RtnlMessage::parse_with_param(&recv_msgbuf, RTM_NEWNSID) {
             Ok(RtnlMessage::NewNsId(NsidMessage { nlas, .. })) => match nlas.get(0) {
                 Some(Id(id)) => Ok(Self {
-                    name: name,
+                    name,
                     nsid: match id {
                         -1 => None,
                         _ => Some(*id),
